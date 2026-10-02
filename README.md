@@ -2,7 +2,7 @@
 
 ## What this builds
 
-The attached `jls-ubuntu-dev-vendor-data.yaml` turns a clean Ubuntu 24.04 cloud image into a persistent development runtime with:
+The attached `jls-ubuntu-dev-vendor-data.yaml` provisions an Ubuntu cloud image as a persistent development runtime with:
 
 - Docker Engine from Docker's official apt repository, Buildx, `docker compose` v2, and Docker Sandboxes (`sbx`);
 - Mise with the current Node.js LTS and `uv` selected globally;
@@ -22,7 +22,77 @@ Proxmox generates cloud-init user-data from `ciuser`, `sshkeys`, hostname, and r
 
 The bootstrap discovers the normal `/home` login user at runtime, so it works whether `ciuser` is `josh`, `ubuntu`, or another name. If a guest intentionally has several normal users, run the bootstrap manually with `sudo JLS_DEV_USER=name /usr/local/sbin/jls-bootstrap-dev-vm` or hard-code the intended user in a derived copy.
 
-## Proxmox installation
+## Build the template
+
+`qmtemplatemaker.sh` downloads the latest **supported, released Ubuntu Server LTS
+amd64 cloud image** using [Canonical's release metadata](https://cloud-images.ubuntu.com/releases/streams/v1/com.ubuntu.cloud:released:download.json).
+At verification on October 2, 2026, this selected Ubuntu 26.04 LTS. It uses a dated
+image URL and checks its SHA-256 against metadata retrieved over HTTPS before
+customizing the image. This is checksum verification, not detached-signature verification.
+
+Copy `qmtemplatemaker.sh`, `devbox.sh`, and `jls-ubuntu-dev-vendor-data.yaml` into
+the same directory on your **Proxmox host**, then run as root:
+
+```bash
+apt-get update
+apt-get install -y libguestfs-tools curl python3 openssh-client
+pvesm status
+bash qmtemplatemaker.sh
+```
+
+Defaults match the original host configuration: VM ID **9000**, disk storage
+**live**, snippet storage **local**, bridge **vmbr0**, user **josh**, public key
+**/root/.ssh/macbook.pub**, 4 cores, 4096 MiB memory, and a 32 GiB disk. The SSH
+public key must already be on the host. Enable **Snippets** under Datacenter →
+Storage → local → Edit first; the script checks storage availability and content
+support and does not change your storage configuration.
+
+Override settings through environment variables; `--help` lists all options:
+
+```bash
+STORAGE=local-lvm SSH_KEY=/root/.ssh/laptop.pub bash qmtemplatemaker.sh
+# Optional: select a supported older LTS and a separate template ID.
+VMID=9001 UBUNTU_RELEASE=24.04 bash qmtemplatemaker.sh
+```
+
+Following the attached blog's approach, the builder installs and enables the
+QEMU guest agent offline with `virt-customize`, clears cloud-init state, SSH host
+keys and machine identity, enables TRIM and the serial console, grows the disk,
+and converts the VM directly to a template without booting it. The vendor-data
+file is copied unchanged into snippet storage and attached with `cicustom vendor=`;
+Proxmox still generates the user, SSH keys and network configuration. Developer
+tools install on **each clone's first boot**, so creating the template does not
+prove that every package or upstream installer supports the newly selected LTS.
+
+`CPU=host` is intentional for nested KVM/Docker Sandboxes. Enable nested
+virtualization separately on the host. If migration between unlike CPUs matters
+more, choose a suitable baseline such as `CPU=x86-64-v3`; local nested KVM may
+then be unavailable. The script does not change host virtualization settings.
+
+The host needs outbound HTTPS, and the libguestfs appliance needs network/DNS
+access to Ubuntu package mirrors. Allow several GB of temporary space under
+`/var/tmp` (override with `WORK_ROOT`). Temporary downloads are removed on exit.
+Existing VM/container IDs are rejected cluster-wide. A partial VM is retained
+on failure for inspection; resolve the cause and manually remove that partial
+VM or choose a new ID before retrying.
+
+An existing snippet is reused only when its bytes match. To change the bootstrap
+without affecting other VMs, use a new `SNIPPET_NAME`, for example
+`SNIPPET_NAME=jls-ubuntu-dev-v2.yaml`. Snippets must remain available to every
+node that runs the clones, even when using full clones. Use shared snippet
+storage or copy identical snippets to the destination nodes.
+
+Then run `bash devbox.sh` on the host to create and start a full clone. It
+inherits the template's vendor-data reference. If you changed template ID,
+login user, or key path, update the constants at the top of `devbox.sh` as well.
+Its default clone disk is 100 GiB, which must be at least the template disk size.
+After first boot, use the provisioning checks below before authenticating tools.
+
+Local verification: `bash -n qmtemplatemaker.sh devbox.sh` and
+`python3 -m unittest discover -s tests -v`. The tests mock Proxmox, downloads,
+and libguestfs; a real template build and clone boot must be verified on Proxmox.
+
+## Proxmox installation with an existing template
 
 The commands below run on the Proxmox host. They assume an existing Ubuntu 24.04 cloud-init template with VM ID `9000` and snippet-capable `local` storage.
 
@@ -67,11 +137,11 @@ The commands below run on the Proxmox host. They assume an existing Ubuntu 24.04
 Run these as the normal login user after cloud-init completes:
 
 ```bash
-claude
-codex login --device-auth
+jls-run claude
+jls-run codex login --device-auth
 gh auth login
 sbx login
-paseo
+jls-run paseo
 ```
 
 - Claude Code handles an unreachable callback in SSH sessions by showing a login code that can be pasted back into the terminal.
@@ -87,7 +157,66 @@ The bootstrap installs `docker-sbx` from Docker's official apt repository and ad
 
 Local sandboxes require Ubuntu 24.04 or later and accessible KVM hardware virtualization. Because this developer machine is a Proxmox guest, enable nested virtualization on the Proxmox host and expose the host CPU to the guest (`qm set <VMID> --cpu host` on the Proxmox host, with the VM stopped). Verify that `/dev/kvm` exists and that `jls-doctor` reports KVM access. CPU passthrough alone does not enable nested virtualization on the host. Cloud sandboxes can be used without local KVM.
 
-For an existing VM, copy the updated bootstrap from the vendor-data into `/usr/local/sbin/jls-bootstrap-dev-vm` and rerun it. Updating the Proxmox snippet alone does not rerun cloud-init on an already provisioned VM.
+For an existing VM, updating the Proxmox snippet alone does not rerun cloud-init.
+This revision also adds supporting files: install the updated `jls-doctor`,
+`jls-run`, `/usr/local/share/jls-dev/agent-context.md`, and
+`/usr/local/lib/jls-dev/install-agent-context` from the YAML's `write_files`
+alongside the updated `/usr/local/sbin/jls-bootstrap-dev-vm`, using the declared
+owners and permissions, before rerunning the bootstrap. New clones receive
+all these files automatically.
+
+## Agent awareness and headless launches
+
+The bootstrap adds a managed environment guide to the discovered user's
+`~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`. An existing Codex
+`AGENTS.override.md` also receives the guide because it takes precedence over
+`AGENTS.md`. Existing personal text, file permissions, and symlinks are preserved;
+reruns replace only the block between the JLS markers. Malformed or duplicate
+markers stop the update instead of guessing which text to replace.
+
+The common source is `/usr/local/share/jls-dev/agent-context.md`. It describes
+installed tools, mise runtime management, project isolation, troubleshooting,
+and the distinction between installed and authenticated CLIs. It keeps machine
+details out of repository instructions. Start a new agent session after updates.
+For a separate Codex profile, run as the login user:
+
+```bash
+CODEX_HOME=/path/to/profile /usr/local/lib/jls-dev/install-agent-context
+```
+
+Use the launcher for direct or headless execution, as the normal login user:
+
+```bash
+jls-run codex
+jls-run claude
+jls-run paseo
+jls-run jls-doctor --json
+```
+
+`jls-run` explicitly prepends the user's local binaries, mise shims, and standard
+system binary directories to PATH, then executes the command with its arguments
+unchanged. It does not depend on `.bashrc`, start a login shell, change directory,
+or inject a prompt. For a service, set the correct user and HOME and use an
+absolute launcher path in its command, for example
+`/usr/local/bin/jls-run <your-existing-agent-command>`. Restart an already running
+launcher/service to pick up the new environment and group memberships. Installing
+this file does not modify or restart existing Paseo or other services.
+
+`jls-doctor --json` emits one JSON report and exits **0** when ready or **1** when
+checks fail; failure reports are still valid JSON. It checks current executable
+paths and versions (including uv), Docker Compose/Buildx, Docker daemon access,
+guest-agent and Docker services, provisioning completion, KVM access, and reboot
+status. Each subprocess has a five-second timeout. Missing optional KVM access
+and a pending reboot are reported but do not themselves fail the readiness check.
+Authentication is not checked. `/var/lib/jls-dev/versions.txt` remains the
+provisioning-time record rather than the source of live versions.
+
+Run diagnostics as the agent user in its actual execution environment. Running
+`jls-doctor` directly inspects the inherited PATH; running it through `jls-run`
+checks the launcher's PATH. Root's Docker/KVM access does not prove user access,
+and tools installed on the devbox are not necessarily available in a container
+or sandbox. No automatic startup hook is installed: the short instruction block
+directs agents to run diagnostics when needed.
 
 ## Project dependency pattern
 

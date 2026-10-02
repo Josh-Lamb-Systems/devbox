@@ -93,48 +93,199 @@ write_files:
     owner: root:root
     permissions: '0755'
     content: |
+      #!/usr/bin/python3
+      """Read-only checks in the caller's environment. No installs or authentication."""
+      import argparse
+      import datetime
+      import json
+      import os
+      from pathlib import Path
+      import pwd
+      import shutil
+      import subprocess
+
+
+      def probe(argv):
+          try:
+              result = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+              # Bound output and never return credential-bearing environment/config data.
+              return {"ok": result.returncode == 0, "exit_code": result.returncode,
+                      "output": result.stdout.strip()[:512]}
+          except subprocess.TimeoutExpired:
+              return {"ok": False, "exit_code": None, "output": "timeout after 5s"}
+          except OSError:
+              return {"ok": False, "exit_code": None, "output": "command unavailable"}
+
+
+      def collect():
+          commands = {}
+          for name in ("curl", "git", "gh", "jq", "rg", "fd", "mise", "node", "npm",
+                       "uv", "python3", "make", "gcc", "tmux", "docker", "sbx", "claude", "codex", "paseo"):
+              path = shutil.which(name)
+              version = probe([path, "-V" if name == "tmux" else "--version"]) if path else None
+              commands[name] = {"path": path, "available": bool(path), "version_probe": version}
+          services = {name: probe(["systemctl", "is-active", name])
+                      for name in ("docker", "qemu-guest-agent")}
+          docker = {"compose": probe(["docker", "compose", "version"]),
+                    "buildx": probe(["docker", "buildx", "version"]),
+                    "daemon_access": probe(["docker", "info", "--format", "{{.ServerVersion}}"])}
+          complete = Path('/var/lib/jls-dev/bootstrap-complete').is_file()
+          failures = [f"command:{name}" for name, item in commands.items()
+                      if not item['available'] or not item['version_probe']['ok']]
+          failures += [f"service:{name}" for name, item in services.items() if not item['ok']]
+          failures += [f"docker:{name}" for name, item in docker.items() if not item['ok']]
+          if not complete:
+              failures.append('bootstrap:incomplete')
+          return {"schema_version": 1,
+                  "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  "user": pwd.getpwuid(os.getuid()).pw_name, "uid": os.getuid(),
+                  "bootstrap_complete": complete, "authentication_checked": False,
+                  "provisioned_versions_file": "/var/lib/jls-dev/versions.txt",
+                  "commands": commands, "services": services, "docker": docker,
+                  "kvm": {"exists": Path('/dev/kvm').exists(),
+                          "accessible": os.access('/dev/kvm', os.R_OK | os.W_OK)},
+                  "reboot_required": Path('/var/run/reboot-required').exists(),
+                  "failures": failures, "ready": not failures}
+
+
+      def main():
+          parser = argparse.ArgumentParser(description=__doc__)
+          parser.add_argument('--json', action='store_true', help='Print one JSON object; exit 1 when not ready')
+          args = parser.parse_args()
+          report = collect()
+          if args.json:
+              print(json.dumps(report, indent=2))
+          else:
+              print(f"Checking as {report['user']} (uid {report['uid']})")
+              for name, item in report['commands'].items():
+                  version = item['version_probe']
+                  status = (version['output'].splitlines() or ['version unavailable'])[0] if version else 'MISSING'
+                  print(f"{name:16} {item['path'] or '-'} | {status}")
+              for name, item in report['services'].items():
+                  print(f"service {name}: {'active' if item['ok'] else 'NOT ACTIVE'}")
+              for name, item in report['docker'].items():
+                  print(f"docker {name}: {'OK' if item['ok'] else 'UNAVAILABLE'}")
+              print(f"bootstrap complete: {report['bootstrap_complete']}")
+              print(f"local sandbox KVM access: {report['kvm']['accessible']} (optional)")
+              print(f"reboot required: {report['reboot_required']}")
+              print('Provisioning-time versions: ' + report['provisioned_versions_file'])
+              if report['uid'] == 0:
+                  print('Run as the agent login user to check that user\'s Docker/KVM permissions.')
+              if report['failures']:
+                  print('Not ready: ' + ', '.join(report['failures']))
+              print('CLI availability does not verify authentication; no login checks were performed.')
+          return 0 if report['ready'] else 1
+
+
+      if __name__ == '__main__':
+          raise SystemExit(main())
+
+  - path: /usr/local/bin/jls-run
+    owner: root:root
+    permissions: '0755'
+    content: |
       #!/usr/bin/env bash
-      set -u
-
-      failures=0
-      commands=(curl git gh jq rg mise node npm docker sbx claude codex paseo)
-
-      printf '%-16s %s\n' 'COMMAND' 'RESULT'
-      for command_name in "${commands[@]}"; do
-        if command -v "$command_name" >/dev/null 2>&1; then
-          printf '%-16s %s\n' "$command_name" "$(command -v "$command_name")"
-        else
-          printf '%-16s %s\n' "$command_name" 'MISSING'
-          failures=$((failures + 1))
-        fi
-      done
-
-      printf '\nServices:\n'
-      systemctl is-active --quiet docker && echo 'docker: active' || { echo 'docker: NOT ACTIVE'; failures=$((failures + 1)); }
-      systemctl is-active --quiet qemu-guest-agent && echo 'qemu-guest-agent: active' || { echo 'qemu-guest-agent: NOT ACTIVE'; failures=$((failures + 1)); }
-
-      if docker version >/dev/null 2>&1; then
-        echo 'docker socket: accessible'
-      else
-        echo 'docker socket: not accessible (log out/in once after provisioning)'
+      # Launch as the normal dev user; usable in a service ExecStart or over SSH.
+      set -euo pipefail
+      if [[ $# == 0 ]]; then
+          echo 'Usage: jls-run COMMAND [ARG ...] (for example: jls-run codex)' >&2
+          exit 2
       fi
+      : "${HOME:?HOME must identify the agent user home}"
+      export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+      exec "$@"
 
-      if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-        echo 'sandboxes: KVM accessible for local microVMs'
-      else
-        echo 'sandboxes: local runtime needs /dev/kvm access (enable nested virtualization and log out/in for kvm membership); cloud sandboxes remain available'
-      fi
+  - path: /usr/local/share/jls-dev/agent-context.md
+    owner: root:root
+    permissions: '0644'
+    content: |
+      # JLS development environment
 
-      if [ -f /var/run/reboot-required ]; then
-        echo 'reboot: required after package upgrades'
-      fi
+      This is a persistent Ubuntu developer VM. Project instructions, runtime pins,
+      and lockfiles determine project workflows; these are machine capabilities.
 
-      if [ -f /var/lib/jls-dev/versions.txt ]; then
-        printf '\nProvisioned versions:\n'
-        cat /var/lib/jls-dev/versions.txt
-      fi
+      - Provisioned: mise, Node.js/npm, uv, Python, GCC/make, Git/gh, curl, jq,
+        rg, fd, tmux, Docker Engine, Buildx, Compose v2, and Docker Sandboxes (sbx).
+      - mise manages the default Node.js and uv installations. Honor repository pins;
+        do not change global runtimes to satisfy a single project.
+      - Use `docker compose` (v2). `fd` is a symlink to Ubuntu's `fdfind`.
+      - Keep dependencies and service data scoped to each repository. Use separate
+        Python environments and Compose project names/volumes for different projects.
+      - Run `jls-doctor --json` as your current user when verifying readiness or
+        troubleshooting. Exit 1 still returns a valid report describing failures.
+      - `/var/lib/jls-dev/versions.txt` records provisioning-time versions, not current
+        versions. Check live versions when they matter.
+      - Before reinstalling a missing tool, check PATH and mise. User tools live in
+        `$HOME/.local/bin` and `$HOME/.local/share/mise/shims`.
+      - For headless launches use `jls-run codex`, `jls-run claude`, or `jls-run paseo`.
+        This sets PATH explicitly without relying on interactive shell startup files.
+      - Installed CLIs do not imply authenticated accounts. Logins remain interactive.
+      - Local Docker Sandboxes require accessible /dev/kvm and host nested virtualization.
+        Missing KVM does not prevent ordinary development or cloud sandbox use.
+      - These capabilities describe the devbox host. Inside a container or sandbox,
+        inspect that environment rather than assuming host tools or access exist.
+      - If provisioning is incomplete, inspect `cloud-init status --long` and
+        `/var/log/jls-dev-bootstrap.log` before attempting repairs.
 
-      exit "$failures"
+  - path: /usr/local/lib/jls-dev/install-agent-context
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/python3
+      """Maintain only the JLS block; run as the dev user, never as root."""
+      import os
+      from pathlib import Path
+      import sys
+      import tempfile
+
+      START = '<!-- BEGIN JLS DEVBOX CONTEXT -->'
+      END = '<!-- END JLS DEVBOX CONTEXT -->'
+
+
+      def merge(original, context):
+          block = START + '\n' + context.rstrip() + '\n' + END
+          if START not in original and END not in original:
+              return original + ('\n\n' if original and not original.endswith('\n\n') else '') + block + '\n'
+          if original.count(START) != 1 or original.count(END) != 1:
+              raise ValueError('Malformed or duplicate JLS markers; repair the instruction file first')
+          first, last = original.index(START), original.index(END)
+          if last < first:
+              raise ValueError('Reversed JLS markers')
+          return original[:first] + block + original[last + len(END):]
+
+
+      def install(home, source):
+          context = source.read_text()
+          codex_home = Path(os.environ.get('CODEX_HOME') or home / '.codex')
+          targets = [codex_home / 'AGENTS.md', home / '.claude/CLAUDE.md']
+          # An existing override takes precedence in Codex; keep it aware too.
+          override = codex_home / 'AGENTS.override.md'
+          if override.exists():
+              targets.append(override)
+          updates = []
+          for target in targets:
+              # Follow user-managed symlinks while preserving the symlink itself.
+              target = target.resolve()
+              original = target.read_text() if target.exists() else ''
+              updates.append((target, merge(original, context)))
+          for target, content in updates:
+              target.parent.mkdir(parents=True, exist_ok=True)
+              mode = target.stat().st_mode & 0o777 if target.exists() else 0o644
+              temporary = None
+              try:
+                  with tempfile.NamedTemporaryFile(mode='w', dir=target.parent, delete=False) as stream:
+                      temporary = Path(stream.name)
+                      stream.write(content)
+                  temporary.chmod(mode)
+                  os.replace(temporary, target)
+              finally:
+                  if temporary is not None and temporary.exists():
+                      temporary.unlink()
+
+
+      if __name__ == '__main__':
+          install(Path.home(), Path(sys.argv[1] if len(sys.argv) > 1 else
+                                   '/usr/local/share/jls-dev/agent-context.md'))
 
   - path: /etc/update-motd.d/99-jls-dev
     owner: root:root
@@ -146,11 +297,11 @@ write_files:
 
       JLS developer VM is ready.
         Check:       jls-doctor
-        Claude:      claude
-        Codex:       codex login --device-auth
+        Claude:      jls-run claude
+        Codex:       jls-run codex login --device-auth
         Sandboxes:   sbx login
         GitHub:      gh auth login
-        Paseo:       paseo
+        Paseo:       jls-run paseo
       No model or repository credentials were baked into this VM.
       EOF
       else
@@ -166,6 +317,8 @@ write_files:
       umask 022
 
       install -d -m 0755 /var/lib/jls-dev
+      # A failed rerun must not leave an old success marker.
+      rm -f /var/lib/jls-dev/bootstrap-complete
       exec > >(tee -a /var/log/jls-dev-bootstrap.log) 2>&1
       trap 'echo "JLS bootstrap failed at line ${LINENO}; rerun sudo /usr/local/sbin/jls-bootstrap-dev-vm after correcting the error."' ERR
 
@@ -276,6 +429,10 @@ write_files:
       fi
       chown "$dev_user:$dev_group" "$bashrc" "$zshrc"
 
+      # Install machine guidance as the discovered user, preserving personal text.
+      runuser --user "$dev_user" -- env HOME="$dev_home" CODEX_HOME="$dev_home/.codex" \
+        /usr/local/lib/jls-dev/install-agent-context
+
       # Record what this particular VM resolved at provision time.
       runuser --user "$dev_user" -- env HOME="$dev_home" bash -lc '
         set -u
@@ -287,6 +444,7 @@ write_files:
           echo "mise=$(mise --version 2>/dev/null || true)"
           echo "node=$(node --version 2>/dev/null || true)"
           echo "npm=$(npm --version 2>/dev/null || true)"
+          echo "uv=$(uv --version 2>/dev/null || true)"
           echo "docker=$(docker --version 2>/dev/null || true)"
           echo "compose=$(docker compose version 2>/dev/null || true)"
           echo "sbx=$(sbx --version)"

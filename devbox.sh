@@ -7,7 +7,7 @@ TEMPLATE_ID=9000
 DISK_SIZE="100G"
 CI_USER="josh"
 SSH_KEY="/root/.ssh/macbook.pub"
-VENDOR_DATA="vendor=local:snippets/jls-ubuntu-dev-vendor-data.yaml"
+# Inherit cicustom vendor-data from the template, including custom snippet names.
 
 is_positive_int() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
 
@@ -55,7 +55,6 @@ qm disk resize "$VMID" scsi0 "$DISK_SIZE"
 qm set "$VMID" --ciuser "$CI_USER"
 qm set "$VMID" --sshkeys "$CLEAN_KEY"
 qm set "$VMID" --ipconfig0 ip=dhcp
-qm set "$VMID" --cicustom "$VENDOR_DATA"
 qm start "$VMID"
 
 echo "VM $VMID ($VM_NAME) created and started."
