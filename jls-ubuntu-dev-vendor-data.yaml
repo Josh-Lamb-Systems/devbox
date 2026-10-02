@@ -1,0 +1,307 @@
+#cloud-config
+# JLS persistent Ubuntu developer VM bootstrap for Proxmox.
+# Attach this as *vendor-data* so Proxmox can continue generating user-data
+# containing ciuser, SSH keys, hostname, and network settings.
+
+timezone: America/New_York
+locale: en_US.UTF-8
+package_update: true
+package_upgrade: true
+ssh_pwauth: false
+
+packages:
+  - acl
+  - bash-completion
+  - btop
+  - build-essential
+  - ca-certificates
+  - curl
+  - dbus-user-session
+  - direnv
+  - dnsutils
+  - eza
+  - eza-bash-completion
+  - fd-find
+  - file
+  - fzf
+  - gh
+  - git
+  - gnupg
+  - htop
+  - httpie
+  - jq
+  - less
+  - libffi-dev
+  - libssl-dev
+  - lsof
+  - make
+  - ncdu
+  - net-tools
+  - openssh-client
+  - pkg-config
+  - procps
+  - python3
+  - python3-pip
+  - python3-venv
+  - qemu-guest-agent
+  - ripgrep
+  - rsync
+  - shellcheck
+  - software-properties-common
+  - strace
+  - sudo
+  - tmux
+  - tree
+  - uidmap
+  - unzip
+  - vim
+  - wget
+  - zip
+  - zsh
+
+write_files:
+  - path: /etc/profile.d/jls-dev-path.sh
+    owner: root:root
+    permissions: '0644'
+    content: |
+      # User-local CLIs and mise shims installed by the JLS bootstrap.
+      if [ -n "${HOME:-}" ]; then
+        export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+      fi
+
+  - path: /etc/docker/daemon.json
+    owner: root:root
+    permissions: '0644'
+    content: |
+      {
+        "log-driver": "local",
+        "log-opts": {
+          "max-size": "10m",
+          "max-file": "3"
+        }
+      }
+
+  - path: /etc/sysctl.d/99-jls-dev.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      # Avoid file-watcher exhaustion in large Node and IDE workspaces.
+      fs.inotify.max_user_instances = 1024
+      fs.inotify.max_user_watches = 524288
+
+  - path: /usr/local/bin/jls-doctor
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -u
+
+      failures=0
+      commands=(curl git gh jq rg mise node npm docker sbx claude codex paseo)
+
+      printf '%-16s %s\n' 'COMMAND' 'RESULT'
+      for command_name in "${commands[@]}"; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+          printf '%-16s %s\n' "$command_name" "$(command -v "$command_name")"
+        else
+          printf '%-16s %s\n' "$command_name" 'MISSING'
+          failures=$((failures + 1))
+        fi
+      done
+
+      printf '\nServices:\n'
+      systemctl is-active --quiet docker && echo 'docker: active' || { echo 'docker: NOT ACTIVE'; failures=$((failures + 1)); }
+      systemctl is-active --quiet qemu-guest-agent && echo 'qemu-guest-agent: active' || { echo 'qemu-guest-agent: NOT ACTIVE'; failures=$((failures + 1)); }
+
+      if docker version >/dev/null 2>&1; then
+        echo 'docker socket: accessible'
+      else
+        echo 'docker socket: not accessible (log out/in once after provisioning)'
+      fi
+
+      if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        echo 'sandboxes: KVM accessible for local microVMs'
+      else
+        echo 'sandboxes: local runtime needs /dev/kvm access (enable nested virtualization and log out/in for kvm membership); cloud sandboxes remain available'
+      fi
+
+      if [ -f /var/run/reboot-required ]; then
+        echo 'reboot: required after package upgrades'
+      fi
+
+      if [ -f /var/lib/jls-dev/versions.txt ]; then
+        printf '\nProvisioned versions:\n'
+        cat /var/lib/jls-dev/versions.txt
+      fi
+
+      exit "$failures"
+
+  - path: /etc/update-motd.d/99-jls-dev
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      if [ -f /var/lib/jls-dev/bootstrap-complete ]; then
+        cat <<'EOF'
+
+      JLS developer VM is ready.
+        Check:       jls-doctor
+        Claude:      claude
+        Codex:       codex login --device-auth
+        Sandboxes:   sbx login
+        GitHub:      gh auth login
+        Paseo:       paseo
+      No model or repository credentials were baked into this VM.
+      EOF
+      else
+        echo 'JLS developer bootstrap is still running; check cloud-init status --wait.'
+      fi
+
+  - path: /usr/local/sbin/jls-bootstrap-dev-vm
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      umask 022
+
+      install -d -m 0755 /var/lib/jls-dev
+      exec > >(tee -a /var/log/jls-dev-bootstrap.log) 2>&1
+      trap 'echo "JLS bootstrap failed at line ${LINENO}; rerun sudo /usr/local/sbin/jls-bootstrap-dev-vm after correcting the error."' ERR
+
+      echo "[$(date --iso-8601=seconds)] Starting JLS developer VM bootstrap"
+
+      # Proxmox creates the login account through its generated user-data.
+      # Select the first normal /home user, with an optional explicit override.
+      dev_user="${JLS_DEV_USER:-}"
+      if [ -z "$dev_user" ]; then
+        dev_user="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $6 ~ /^\/home\// && $7 !~ /(nologin|false)$/ { print $1; exit }')"
+      fi
+      if [ -z "$dev_user" ] || ! id "$dev_user" >/dev/null 2>&1; then
+        echo 'Could not identify the Proxmox cloud-init login user.' >&2
+        exit 1
+      fi
+      dev_home="$(getent passwd "$dev_user" | cut -d: -f6)"
+      dev_group="$(id -gn "$dev_user")"
+      echo "Provisioning user: $dev_user ($dev_home)"
+
+      export DEBIAN_FRONTEND=noninteractive
+
+      # Docker Engine + Buildx + Compose v2 + Sandboxes from Docker's apt repository.
+      install -d -m 0755 /etc/apt/keyrings
+      curl --fail --silent --show-error --location \
+        https://download.docker.com/linux/ubuntu/gpg \
+        --output /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+
+      docker_arch="$(dpkg --print-architecture)"
+      . /etc/os-release
+      if [ "${ID:-}" != ubuntu ]; then
+        echo "This bootstrap supports Ubuntu only; detected ${PRETTY_NAME:-unknown}." >&2
+        exit 1
+      fi
+      docker_suite="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+      cat >/etc/apt/sources.list.d/docker.sources <<EOF
+      Types: deb
+      URIs: https://download.docker.com/linux/ubuntu
+      Suites: ${docker_suite}
+      Components: stable
+      Architectures: ${docker_arch}
+      Signed-By: /etc/apt/keyrings/docker.asc
+      EOF
+
+      apt-get update
+      apt-get install --yes --no-install-recommends \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-ce \
+        docker-ce-cli \
+        docker-compose-plugin \
+        docker-sbx
+
+      systemctl enable --now docker
+      systemctl enable --now qemu-guest-agent
+      sysctl --system >/dev/null
+
+      # Ubuntu packages fd as fdfind to avoid a historical name collision.
+      ln -sfn "$(command -v fdfind)" /usr/local/bin/fd
+
+      # Membership in the docker group is intentionally enabled for this trusted
+      # personal VM. It is effectively root access and is not an isolation boundary.
+      usermod --append --groups docker "$dev_user"
+
+      # Local Docker Sandboxes use KVM; nested virtualization must be exposed
+      # by the Proxmox host. Allow cloud-only use when /dev/kvm is unavailable.
+      groupadd --force kvm
+      usermod --append --groups kvm "$dev_user"
+
+      # Install user-owned tools. Nothing below needs or receives credentials.
+      runuser --user "$dev_user" -- env HOME="$dev_home" bash -lc '
+        set -Eeuo pipefail
+        curl -fsSL https://mise.run | sh
+        export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+
+        mise use --global node@lts uv@latest
+        mise exec -- npm install --global @getpaseo/cli
+        mise reshim
+
+        # Stable Claude Code channel; the native install updates itself.
+        curl -fsSL https://claude.ai/install.sh | bash -s stable
+
+        # Official Codex standalone installer.
+        curl -fsSL https://chatgpt.com/codex/install.sh | sh
+      '
+
+      # Ensure interactive shells activate mise without duplicating the block.
+      bash_marker='# >>> JLS mise activation >>>'
+      bashrc="$dev_home/.bashrc"
+      if ! grep -Fq "$bash_marker" "$bashrc" 2>/dev/null; then
+        cat >>"$bashrc" <<'EOF'
+
+      # >>> JLS mise activation >>>
+      export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+      eval "$(mise activate bash)"
+      # <<< JLS mise activation <<<
+      EOF
+      fi
+
+      zshrc="$dev_home/.zshrc"
+      if ! grep -Fq "$bash_marker" "$zshrc" 2>/dev/null; then
+        cat >>"$zshrc" <<'EOF'
+      # >>> JLS mise activation >>>
+      export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+      eval "$(mise activate zsh)"
+      # <<< JLS mise activation <<<
+      EOF
+      fi
+      chown "$dev_user:$dev_group" "$bashrc" "$zshrc"
+
+      # Record what this particular VM resolved at provision time.
+      runuser --user "$dev_user" -- env HOME="$dev_home" bash -lc '
+        set -u
+        export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+        {
+          echo "provisioned_at=$(date --iso-8601=seconds)"
+          echo "os=$(source /etc/os-release; printf %s "$PRETTY_NAME")"
+          echo "kernel=$(uname -r)"
+          echo "mise=$(mise --version 2>/dev/null || true)"
+          echo "node=$(node --version 2>/dev/null || true)"
+          echo "npm=$(npm --version 2>/dev/null || true)"
+          echo "docker=$(docker --version 2>/dev/null || true)"
+          echo "compose=$(docker compose version 2>/dev/null || true)"
+          echo "sbx=$(sbx --version)"
+          echo "claude=$(claude --version 2>/dev/null || true)"
+          echo "codex=$(codex --version 2>/dev/null || true)"
+          echo "paseo=$(paseo --version 2>/dev/null || true)"
+        }
+      ' >/var/lib/jls-dev/versions.txt
+
+      touch /var/lib/jls-dev/bootstrap-complete
+      echo "[$(date --iso-8601=seconds)] JLS developer VM bootstrap complete"
+
+runcmd:
+  - [bash, -lc, /usr/local/sbin/jls-bootstrap-dev-vm]
+
+final_message: |
+  JLS developer VM cloud-init finished after $UPTIME seconds.
+  Log in again, run jls-doctor, then authenticate with claude, codex, gh, and paseo.
