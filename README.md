@@ -5,11 +5,11 @@
 The attached `jls-ubuntu-dev-vendor-data.yaml` provisions an Ubuntu cloud image as a persistent development runtime with:
 
 - Docker Engine from Docker's official apt repository, Buildx, `docker compose` v2, and Docker Sandboxes (`sbx`);
-- Mise with the current Node.js LTS and `uv` selected globally;
+- Mise with the current Node.js LTS, `uv`, Go, stable Rust/Cargo, and Python 3.14 selected globally;
 - Claude Code on Anthropic's stable native channel;
 - Codex from OpenAI's standalone installer;
 - Paseo's headless server/CLI, plus GitHub CLI;
-- Git, curl, jq, ripgrep, fd, fzf, tmux, build tools, Python/venv, and common diagnostics;
+- Git/LFS, curl, jq, ripgrep, fd, fzf, tmux, CMake/Ninja, SQLite CLI/development headers, system Python/venv/development headers, and common diagnostics;
 - QEMU guest agent, a small `jls-doctor` check, version recording, and bounded Docker logs.
 
 It deliberately contains no model, GitHub, Paseo, repository, or software-factory credentials.
@@ -164,6 +164,10 @@ This revision also adds supporting files: install the updated `jls-doctor`,
 alongside the updated `/usr/local/sbin/jls-bootstrap-dev-vm`, using the declared
 owners and permissions, before rerunning the bootstrap. New clones receive
 all these files automatically.
+The maintenance revision also needs `/etc/apt/apt.conf.d/99-jls-security-updates`,
+`/etc/systemd/journald.conf.d/99-jls-limits.conf`, and
+`/etc/logrotate.d/jls-dev-bootstrap` from `write_files` before rerunning on an
+existing VM. The bootstrap installs their required packages and enables timers.
 
 ## Agent awareness and headless launches
 
@@ -203,7 +207,8 @@ launcher/service to pick up the new environment and group memberships. Installin
 this file does not modify or restart existing Paseo or other services.
 
 `jls-doctor --json` emits one JSON report and exits **0** when ready or **1** when
-checks fail; failure reports are still valid JSON. It checks current executable
+readiness checks fail; failure reports are still valid JSON. Maintenance warnings
+appear separately in `warnings` and do not alone change the exit code. It checks current executable
 paths and versions (including uv), Docker Compose/Buildx, Docker daemon access,
 guest-agent and Docker services, provisioning completion, KVM access, and reboot
 status. Each subprocess has a five-second timeout. Missing optional KVM access
@@ -217,6 +222,119 @@ checks the launcher's PATH. Root's Docker/KVM access does not prove user access,
 and tools installed on the devbox are not necessarily available in a container
 or sandbox. No automatic startup hook is installed: the short instruction block
 directs agents to run diagnostics when needed.
+
+## Security updates, log retention, and storage
+
+The bootstrap ensures `unattended-upgrades`, `python3-apt`, and `logrotate` are
+installed. It configures daily APT package-list refreshes and unattended upgrades,
+explicitly disables automatic reboots, and enables `apt-daily.timer`,
+`apt-daily-upgrade.timer`, and `logrotate.timer`. Ubuntu's existing allowed-origin
+configuration is preserved. Third-party repositories and mise runtimes are not
+automatically covered by this Ubuntu security-update policy.
+
+`jls-doctor` reads effective APT configuration through Ubuntu's `apt_pkg` and checks
+that a security origin is listed, daily jobs are configured, the update timers
+are enabled/active, and automatic reboot is disabled. Drift or an unreadable
+configuration produces a maintenance warning. This verifies configuration, not
+successful installation of the latest security updates. For a deeper check on
+the guest, inspect `journalctl -u apt-daily-upgrade.service` and
+`/var/log/unattended-upgrades/`, or run
+`sudo unattended-upgrade --dry-run --debug`.
+
+Journald is configured for **512 MiB** of persistent journal usage, **128 MiB**
+of runtime journal usage, **14 days** of retention, and free-space reserves of
+1 GiB on disk and 64 MiB in runtime storage. Existing persistence behavior is
+preserved. These are journald retention targets; active journal files and other
+logs mean they are not a strict cap on all of `/var/log`.
+
+The bootstrap log rotates daily, with a **10 MiB** size trigger at rotation checks
+and **seven archives**, using compression and `copytruncate` so an ongoing
+bootstrap can keep writing. Size is checked when logrotate runs, so the active
+file can exceed 10 MiB between daily checks. `copytruncate` has a small window
+in which concurrent log lines may be lost. Existing Docker log limits remain in
+place. The bootstrap parses the rotation configuration with `logrotate --debug`
+before declaring completion; it does not force a rotation.
+
+Storage diagnostics inspect `/`, the calling user's home, `/var/log`, and Docker's
+reported data directory. If Docker cannot report its path, the report explicitly
+marks `/var/lib/docker` as an unverified fallback. Absent paths use their nearest
+existing parent; permission failures are reported as unknown. Multiple paths
+may refer to the same filesystem and their capacity must not be added together.
+
+- **Warning:** less than 5 GiB available, 10% of disk capacity available, or 10%
+  of inodes available.
+- **Critical / readiness failure:** less than 1 GiB available, 2% of disk capacity
+  available, or 2% of inodes available.
+- Filesystems without a fixed inode count report inode percentage as unknown.
+
+Diagnostics do not delete data, prune containers/volumes, or run upgrades.
+
+## Language runtimes and Python isolation
+
+The bootstrap selects global defaults through mise:
+
+```bash
+mise use --global node@lts uv@latest go@latest rust@latest python@3.14
+```
+
+These are user-owned development runtimes. Project `mise.toml` files can override
+those defaults; commit project pins and lockfiles for reproducibility.
+
+| Runtime | Default policy | Support meaning |
+|---|---|---|
+| Node.js | `node@lts` | Upstream LTS channel |
+| Python | `python@3.14` | Latest available patch in the 3.14 series; upstream security support scheduled through October 2030 |
+| Go | `go@latest` | Latest stable at provisioning; upstream supports its two newest major release lines |
+| Rust | `rust@latest` | Latest stable at provisioning; upstream uses a six-week stable release cycle |
+
+Python, Go, and Rust do **not** have upstream LTS channels equivalent to Node or
+Ubuntu. These defaults favor supported stable releases without inventing `lts`
+aliases. Python will not automatically jump to 3.15. Go and Rust may advance
+release lines on a new provisioning run. Already provisioned VMs need deliberate
+runtime upgrades; Ubuntu apt upgrades do not update mise-managed installations.
+Review pins before their support windows expire. Support policies checked
+October 2, 2026: [Python](https://devguide.python.org/versions/),
+[Go](https://go.dev/doc/devel/release#policy), and
+[Rust](https://doc.rust-lang.org/book/appendix-07-nightly-rust.html).
+
+Mise's Rust backend manages rustup under the hood; no independent apt Rust
+toolchain or rustup installer is added. Use mise shims or `mise exec -- cargo build`.
+For existing `rust-toolchain.toml` projects, enable mise's Rust idiomatic-file
+discovery rather than adding a conflicting version pin.
+
+Ubuntu still maintains `python3`, `python3-pip`, `python3-venv`, and `python3-dev`.
+`/usr/bin/python3` stays untouched and runs the JLS diagnostic and instruction
+installer scripts. `python3-dev` supplies headers for Ubuntu's interpreter only.
+The separate mise Python is selected through user PATH/mise execution. Diagnostics
+and `versions.txt` report both system and development interpreters separately.
+
+**Mise chooses Python; uv manages the project environment and dependencies.** For
+a new project (choose a version matching its requirements):
+
+```bash
+mise use python@3.14
+uv venv --python "$(mise which python)" --no-python-downloads
+```
+
+For an existing uv project:
+
+```bash
+mise install
+uv sync --python "$(mise which python)" --no-python-downloads
+uv run --python "$(mise which python)" --no-python-downloads python --version
+```
+
+Honor `requires-python` and the lockfile. For repositories using only
+`.python-version`, enable mise Python idiomatic-file discovery or add a matching
+mise project pin; do not silently fall back to the global version. Stop and resolve
+incompatible pins before recreating an existing environment.
+
+Do not use `uv python install` or `--managed-python` for this workflow: those
+select uv-owned interpreters. Passing the explicit mise interpreter avoids
+ambiguity, and `--no-python-downloads` prevents uv from downloading a second one.
+Keep dependencies in `.venv`; do not use `sudo pip`, `--break-system-packages`, or
+replace `/usr/bin/python3`. See [mise Python](https://mise.jdx.dev/lang/python.html)
+and [uv interpreter selection](https://docs.astral.sh/uv/concepts/python-versions/).
 
 ## Project dependency pattern
 

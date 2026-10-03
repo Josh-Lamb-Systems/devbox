@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 try:
@@ -115,6 +116,8 @@ class AwarenessTests(unittest.TestCase):
 
     def test_doctor_distinguishes_docker_access_and_optional_kvm(self):
         def probe(argv):
+            if argv[0] == '/bin/go':
+                self.assertEqual(argv, ['/bin/go', 'version'])
             ok = argv[:2] != ['docker', 'info']
             return {'ok': ok, 'exit_code': 0 if ok else 1, 'output': 'version' if ok else ''}
         with patch.object(self.doctor.shutil, 'which', side_effect=lambda name: '/bin/' + name), \
@@ -128,6 +131,8 @@ class AwarenessTests(unittest.TestCase):
         self.assertFalse(report['kvm']['accessible'])
         self.assertEqual(report['failures'], ['docker:daemon_access'])
         self.assertIn('uv', report['commands'])
+        for name in ('go', 'rustc', 'cargo', 'cmake', 'ninja', 'sqlite3', 'git-lfs'):
+            self.assertTrue(report['commands'][name]['version_probe']['ok'])
 
     def test_doctor_failed_probe_timeout_and_json_exit(self):
         with patch.object(self.doctor.subprocess, 'run', side_effect=subprocess.TimeoutExpired('probe', 5)):
@@ -141,6 +146,56 @@ class AwarenessTests(unittest.TestCase):
         self.assertFalse(report['ready'])
         self.assertFalse(report['commands']['uv']['available'])
         self.assertIn('bootstrap:incomplete', report['failures'])
+
+    def test_system_python_does_not_mask_missing_mise_python(self):
+        def probe(argv):
+            ok = argv[0] != 'mise'
+            return {'ok': ok, 'exit_code': 0 if ok else 1, 'output': 'Python 3.x' if ok else ''}
+        with patch.object(self.doctor.shutil, 'which', side_effect=lambda name: '/bin/' + name), \
+             patch.object(self.doctor, 'probe', side_effect=probe), \
+             patch.object(self.doctor.Path, 'is_file', return_value=True):
+            report = self.doctor.collect()
+        self.assertTrue(report['python_interpreters']['system']['ok'])
+        self.assertFalse(report['python_interpreters']['mise_selected']['ok'])
+        self.assertIn('python:mise_selected', report['failures'])
+        self.assertFalse(report['ready'])
+
+    def test_storage_thresholds_and_unavailable_inodes(self):
+        for free_gib, inodes, total_inodes, expected in (
+            (20, 500, 1000, 'ok'), (4, 500, 1000, 'warning'),
+            (0.5, 500, 1000, 'critical'), (20, 10, 1000, 'critical'),
+            (20, 50, 1000, 'warning'), (20, 0, 0, 'ok')):
+            with self.subTest(expected=expected, free_gib=free_gib, inodes=inodes):
+                stats = SimpleNamespace(f_blocks=100 * 1024, f_frsize=1024**2,
+                                        f_bavail=free_gib * 1024, f_favail=inodes, f_files=total_inodes)
+                with patch.object(self.doctor.os, 'statvfs', return_value=stats):
+                    result = self.doctor.storage_check('/var/log')
+                self.assertEqual(result['status'], expected)
+                if total_inodes == 0:
+                    self.assertIsNone(result['available_inode_percent'])
+
+    def test_storage_permission_failure_is_not_reported_as_parent_capacity(self):
+        with patch.object(self.doctor.os, 'statvfs', side_effect=PermissionError('denied')):
+            result = self.doctor.storage_check('/var/lib/docker')
+        self.assertEqual(result['status'], 'unknown')
+
+    def test_security_configuration_and_timer_drift(self):
+        settings = {'APT::Periodic::Enable': '1', 'APT::Periodic::Update-Package-Lists': '1',
+                    'APT::Periodic::Unattended-Upgrade': '1', 'Unattended-Upgrade::Automatic-Reboot': 'false'}
+        apt = SimpleNamespace(init_config=lambda: None, config=SimpleNamespace(
+            find=lambda key: settings.get(key, ''),
+            value_list=lambda key: ['${distro_id}:${distro_codename}-security'] if key.endswith('Allowed-Origins') else []))
+        with patch.dict('sys.modules', {'apt_pkg': apt}), \
+             patch.object(self.doctor.shutil, 'which', return_value='/usr/bin/unattended-upgrade'), \
+             patch.object(self.doctor, 'probe', return_value={'ok': True, 'exit_code': 0, 'output': 'active'}):
+            report = self.doctor.security_update_check()
+            self.assertEqual(report['status'], 'ok')
+            self.assertFalse(report['last_update_success_verified'])
+            settings['Unattended-Upgrade::Automatic-Reboot'] = 'true'
+            self.assertEqual(self.doctor.security_update_check()['status'], 'warning')
+            settings['Unattended-Upgrade::Automatic-Reboot'] = 'false'
+            with patch.object(self.doctor, 'probe', return_value={'ok': False, 'exit_code': 1, 'output': 'disabled'}):
+                self.assertEqual(self.doctor.security_update_check()['status'], 'warning')
 
 
 if __name__ == '__main__':

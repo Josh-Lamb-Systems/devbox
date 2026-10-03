@@ -15,6 +15,7 @@ packages:
   - btop
   - build-essential
   - ca-certificates
+  - cmake
   - curl
   - dbus-user-session
   - direnv
@@ -26,6 +27,7 @@ packages:
   - fzf
   - gh
   - git
+  - git-lfs
   - gnupg
   - htop
   - httpie
@@ -33,14 +35,19 @@ packages:
   - less
   - libffi-dev
   - libssl-dev
+  - libsqlite3-dev
   - lsof
+  - logrotate
   - make
   - ncdu
   - net-tools
+  - ninja-build
   - openssh-client
   - pkg-config
   - procps
   - python3
+  - python3-apt
+  - python3-dev
   - python3-pip
   - python3-venv
   - qemu-guest-agent
@@ -48,11 +55,13 @@ packages:
   - rsync
   - shellcheck
   - software-properties-common
+  - sqlite3
   - strace
   - sudo
   - tmux
   - tree
   - uidmap
+  - unattended-upgrades
   - unzip
   - vim
   - wget
@@ -68,6 +77,42 @@ write_files:
       if [ -n "${HOME:-}" ]; then
         export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
       fi
+
+  - path: /etc/apt/apt.conf.d/99-jls-security-updates
+    owner: root:root
+    permissions: '0644'
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      Unattended-Upgrade::Automatic-Reboot "false";
+      // Keep Ubuntu's security origin selection from 50unattended-upgrades.
+
+  - path: /etc/systemd/journald.conf.d/99-jls-limits.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Journal]
+      SystemMaxUse=512M
+      SystemKeepFree=1G
+      RuntimeMaxUse=128M
+      RuntimeKeepFree=64M
+      MaxRetentionSec=14day
+
+  - path: /etc/logrotate.d/jls-dev-bootstrap
+    owner: root:root
+    permissions: '0644'
+    content: |
+      /var/log/jls-dev-bootstrap.log {
+          daily
+          maxsize 10M
+          rotate 7
+          compress
+          delaycompress
+          missingok
+          notifempty
+          copytruncate
+          su root root
+      }
 
   - path: /etc/docker/daemon.json
     owner: root:root
@@ -117,23 +162,109 @@ write_files:
               return {"ok": False, "exit_code": None, "output": "command unavailable"}
 
 
+      def storage_check(path):
+          requested = Path(path)
+          assessed = requested
+          try:
+              # An absent Docker directory still consumes its nearest existing parent's filesystem.
+              while True:
+                  try:
+                      stat = os.statvfs(assessed)
+                      break
+                  except FileNotFoundError:
+                      if assessed == assessed.parent:
+                          raise
+                      assessed = assessed.parent
+              total = stat.f_blocks * stat.f_frsize
+              available = stat.f_bavail * stat.f_frsize
+              free_pct = available * 100 / total if total else None
+              inode_pct = stat.f_favail * 100 / stat.f_files if stat.f_files else None
+              critical = (available < 1024**3 or (free_pct is not None and free_pct < 2)
+                          or (inode_pct is not None and inode_pct < 2))
+              warning = (available < 5 * 1024**3 or (free_pct is not None and free_pct < 10)
+                         or (inode_pct is not None and inode_pct < 10))
+              return {"path": str(requested), "assessed_path": str(assessed),
+                      "available_bytes": available, "total_bytes": total,
+                      "available_percent": free_pct, "available_inodes": stat.f_favail,
+                      "available_inode_percent": inode_pct,
+                      "status": "critical" if critical else "warning" if warning else "ok"}
+          except OSError as error:
+              return {"path": str(requested), "status": "unknown", "error": str(error)}
+
+
+      def security_update_check():
+          result = {"status": "unknown", "issues": [], "timers": {}}
+          try:
+              # jls-doctor's absolute system-Python shebang can import Ubuntu's python3-apt.
+              import apt_pkg
+              apt_pkg.init_config()
+              config = apt_pkg.config
+              settings = {key: config.find(key) for key in (
+                  'APT::Periodic::Enable', 'APT::Periodic::Update-Package-Lists',
+                  'APT::Periodic::Unattended-Upgrade', 'Unattended-Upgrade::Automatic-Reboot')}
+              origins = config.value_list('Unattended-Upgrade::Allowed-Origins')
+              origins += config.value_list('Unattended-Upgrade::Origins-Pattern')
+              result.update(settings=settings, allowed_origins=origins)
+              if settings['APT::Periodic::Enable'].lower() in ('0', 'false', 'no'):
+                  result['issues'].append('APT periodic jobs are disabled')
+              for key in ('APT::Periodic::Update-Package-Lists', 'APT::Periodic::Unattended-Upgrade'):
+                  if settings[key] != '1':
+                      result['issues'].append(key + ' is not configured daily (1)')
+              if settings['Unattended-Upgrade::Automatic-Reboot'].lower() not in ('false', '0', 'no'):
+                  result['issues'].append('Automatic reboot is not explicitly disabled')
+              if not any('-security' in origin for origin in origins):
+                  result['issues'].append('No security origin found in unattended-upgrades configuration')
+              if not shutil.which('unattended-upgrade'):
+                  result['issues'].append('unattended-upgrades executable missing')
+              for timer in ('apt-daily.timer', 'apt-daily-upgrade.timer'):
+                  enabled = probe(['systemctl', 'is-enabled', timer])
+                  active = probe(['systemctl', 'is-active', timer])
+                  result['timers'][timer] = {'enabled': enabled, 'active': active}
+                  if not enabled['ok'] or not active['ok']:
+                      result['issues'].append(timer + ' is not enabled and active')
+              result['status'] = 'warning' if result['issues'] else 'ok'
+          except (ImportError, OSError, SystemError, ValueError) as error:
+              result['issues'].append('Cannot inspect effective APT configuration: ' + str(error))
+          # Configuration/timers do not establish that the last update succeeded.
+          result['last_update_success_verified'] = False
+          return result
+
+
       def collect():
           commands = {}
           for name in ("curl", "git", "gh", "jq", "rg", "fd", "mise", "node", "npm",
-                       "uv", "python3", "make", "gcc", "tmux", "docker", "sbx", "claude", "codex", "paseo"):
+                       "uv", "python", "python3", "go", "rustc", "cargo", "cmake", "ninja", "sqlite3", "git-lfs",
+                       "make", "gcc", "tmux", "docker", "sbx", "claude", "codex", "paseo"):
               path = shutil.which(name)
-              version = probe([path, "-V" if name == "tmux" else "--version"]) if path else None
+              version_arg = {"tmux": "-V", "go": "version"}.get(name, "--version")
+              version = probe([path, version_arg]) if path else None
               commands[name] = {"path": path, "available": bool(path), "version_probe": version}
           services = {name: probe(["systemctl", "is-active", name])
                       for name in ("docker", "qemu-guest-agent")}
           docker = {"compose": probe(["docker", "compose", "version"]),
                     "buildx": probe(["docker", "buildx", "version"]),
                     "daemon_access": probe(["docker", "info", "--format", "{{.ServerVersion}}"])}
+          python_interpreters = {
+              "system": probe(["/usr/bin/python3", "--version"]),
+              "mise_selected": probe(["mise", "exec", "--", "python", "--version"]),
+              "mise_selected_path": probe(["mise", "which", "python"])}
+          security_updates = security_update_check()
+          docker_root = probe(["docker", "info", "--format", "{{.DockerRootDir}}"])
+          docker_path = docker_root['output'] if docker_root['ok'] and docker_root['output'].startswith('/') else '/var/lib/docker'
+          storage = [storage_check(path) for path in dict.fromkeys(('/', str(Path.home()), '/var/log', docker_path))]
+          warnings = [f"storage:{item['path']}:{item['status']}" for item in storage
+                      if item['status'] in ('warning', 'unknown')]
+          if security_updates['status'] != 'ok':
+              warnings.append('security_updates:' + security_updates['status'])
+          if not docker_root['ok'] or not docker_root['output'].startswith('/'):
+              warnings.append('Docker data path unverified; checking /var/lib/docker as fallback')
           complete = Path('/var/lib/jls-dev/bootstrap-complete').is_file()
           failures = [f"command:{name}" for name, item in commands.items()
                       if not item['available'] or not item['version_probe']['ok']]
           failures += [f"service:{name}" for name, item in services.items() if not item['ok']]
           failures += [f"docker:{name}" for name, item in docker.items() if not item['ok']]
+          failures += [f"python:{name}" for name, item in python_interpreters.items() if not item['ok']]
+          failures += [f"storage:{item['path']}:critical" for item in storage if item['status'] == 'critical']
           if not complete:
               failures.append('bootstrap:incomplete')
           return {"schema_version": 1,
@@ -142,6 +273,8 @@ write_files:
                   "bootstrap_complete": complete, "authentication_checked": False,
                   "provisioned_versions_file": "/var/lib/jls-dev/versions.txt",
                   "commands": commands, "services": services, "docker": docker,
+                  "python_interpreters": python_interpreters,
+                  "security_updates": security_updates, "storage": storage, "warnings": warnings,
                   "kvm": {"exists": Path('/dev/kvm').exists(),
                           "accessible": os.access('/dev/kvm', os.R_OK | os.W_OK)},
                   "reboot_required": Path('/var/run/reboot-required').exists(),
@@ -165,6 +298,17 @@ write_files:
                   print(f"service {name}: {'active' if item['ok'] else 'NOT ACTIVE'}")
               for name, item in report['docker'].items():
                   print(f"docker {name}: {'OK' if item['ok'] else 'UNAVAILABLE'}")
+              for name, item in report['python_interpreters'].items():
+                  print(f"python {name}: {item['output'] or 'UNAVAILABLE'}")
+              print('Security-update configuration: ' + report['security_updates']['status'])
+              for issue in report['security_updates']['issues']:
+                  print('  ' + issue)
+              for item in report['storage']:
+                  detail = (f"{item['available_bytes'] / 1024**3:.1f} GiB available; "
+                            f"inodes available: {item['available_inode_percent']}%") if 'available_bytes' in item else item.get('error', '')
+                  print(f"storage {item['path']}: {item['status']} ({detail})")
+              for warning in report['warnings']:
+                  print('Warning: ' + warning)
               print(f"bootstrap complete: {report['bootstrap_complete']}")
               print(f"local sandbox KVM access: {report['kvm']['accessible']} (optional)")
               print(f"reboot required: {report['reboot_required']}")
@@ -204,13 +348,33 @@ write_files:
       This is a persistent Ubuntu developer VM. Project instructions, runtime pins,
       and lockfiles determine project workflows; these are machine capabilities.
 
-      - Provisioned: mise, Node.js/npm, uv, Python, GCC/make, Git/gh, curl, jq,
-        rg, fd, tmux, Docker Engine, Buildx, Compose v2, and Docker Sandboxes (sbx).
-      - mise manages the default Node.js and uv installations. Honor repository pins;
+      - Provisioned: mise, Node.js/npm, uv, Go, Rust/Cargo, mise Python and system Python, GCC/make,
+        CMake/Ninja, SQLite CLI/headers, Git/LFS/gh, curl, jq, rg, fd, tmux,
+        Docker Engine, Buildx, Compose v2, and Docker Sandboxes (sbx).
+      - mise manages the default Node.js, uv, Go, Rust, and development Python installations. Honor repository pins;
         do not change global runtimes to satisfy a single project.
+      - For Rust use mise shims or `mise exec -- cargo ...`. For existing
+        rust-toolchain.toml projects, configure mise idiomatic-file discovery for
+        rust rather than introducing a conflicting version pin.
+      - Ubuntu owns /usr/bin/python3. mise selects development Python (global 3.14
+        series, with project overrides); uv manages project .venv and dependencies.
+        Honor mise.toml, pyproject.toml, and uv.lock. If a repository only has
+        .python-version, configure mise Python idiomatic-file discovery or add an
+        agreeing project pin. Do not silently use the global version instead.
+      - Explicitly pass the selected interpreter, for example:
+        `uv sync --python "$(mise which python)" --no-python-downloads`.
+        For a standalone environment use `uv venv --python "$(mise which python)" --no-python-downloads`.
+        Do not use uv python install or --managed-python in this setup.
+        If requirements disagree, resolve the project Python pin first.
+        Never use sudo pip or --break-system-packages, or replace system Python.
+        python3-dev supplies headers for Ubuntu's Python, not every mise Python version.
       - Use `docker compose` (v2). `fd` is a symlink to Ubuntu's `fdfind`.
       - Keep dependencies and service data scoped to each repository. Use separate
         Python environments and Compose project names/volumes for different projects.
+      - System security updates are configured daily with automatic reboot disabled.
+        jls-doctor checks effective settings/timers, not last-update success.
+        Storage warnings are informational; critical disk/inode shortages fail readiness.
+        Diagnose usage before removing data; never automatically prune Docker volumes.
       - Run `jls-doctor --json` as your current user when verifying readiness or
         troubleshooting. Exit 1 still returns a valid report describing failures.
       - `/var/lib/jls-dev/versions.txt` records provisioning-time versions, not current
@@ -365,6 +529,8 @@ write_files:
 
       apt-get update
       apt-get install --yes --no-install-recommends \
+        cmake ninja-build python3-dev sqlite3 libsqlite3-dev git-lfs \
+        unattended-upgrades python3-apt logrotate \
         containerd.io \
         docker-buildx-plugin \
         docker-ce \
@@ -394,7 +560,16 @@ write_files:
         curl -fsSL https://mise.run | sh
         export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
 
-        mise use --global node@lts uv@latest
+        # Python has a supported minor series, not an LTS alias. Go and Rust
+        # have no upstream LTS channel: latest selects stable at provisioning.
+        mise use --global node@lts uv@latest go@latest rust@latest python@3.14
+        # Check the development interpreter without changing /usr/bin/python3.
+        mise exec -- python --version
+        mise exec -- python -c "import ssl, sqlite3, venv; print(ssl.OPENSSL_VERSION)"
+        # Verify both Rust tools and Go through mise before recording success.
+        mise exec -- go version
+        mise exec -- rustc --version
+        mise exec -- cargo --version
         mise exec -- npm install --global @getpaseo/cli
         mise reshim
 
@@ -445,6 +620,12 @@ write_files:
           echo "node=$(node --version 2>/dev/null || true)"
           echo "npm=$(npm --version 2>/dev/null || true)"
           echo "uv=$(uv --version 2>/dev/null || true)"
+          echo "python_system=$(/usr/bin/python3 --version)"
+          echo "python_development=$(mise exec -- python --version)"
+          echo "python_development_path=$(mise which python)"
+          echo "go=$(mise exec -- go version)"
+          echo "rustc=$(mise exec -- rustc --version)"
+          echo "cargo=$(mise exec -- cargo --version)"
           echo "docker=$(docker --version 2>/dev/null || true)"
           echo "compose=$(docker compose version 2>/dev/null || true)"
           echo "sbx=$(sbx --version)"
@@ -453,6 +634,12 @@ write_files:
           echo "paseo=$(paseo --version 2>/dev/null || true)"
         }
       ' >/var/lib/jls-dev/versions.txt
+
+      # Activate maintenance after package installation to avoid first-boot apt contention.
+      systemctl restart systemd-journald
+      systemctl enable --now apt-daily.timer apt-daily-upgrade.timer logrotate.timer
+      # Parse the rotation policy without rotating or modifying log state.
+      logrotate --debug /etc/logrotate.d/jls-dev-bootstrap
 
       touch /var/lib/jls-dev/bootstrap-complete
       echo "[$(date --iso-8601=seconds)] JLS developer VM bootstrap complete"
