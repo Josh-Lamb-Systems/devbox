@@ -270,6 +270,11 @@ write_files:
               warnings.append('security_updates:' + security_updates['status'])
           if not docker_root['ok'] or not docker_root['output'].startswith('/'):
               warnings.append('Docker data path unverified; checking /var/lib/docker as fallback')
+          # Identity is per person and never baked in; report only whether it is set.
+          git_identity = {key: bool(probe(["git", "config", "--get", "user." + key])['output'])
+                          for key in ("name", "email")}
+          warnings += [f"git:user.{key} unset; run git config --global user.{key} ..."
+                       for key, present in git_identity.items() if not present]
           complete = Path('/var/lib/jls-dev/bootstrap-complete').is_file()
           failures = [f"command:{name}" for name, item in commands.items()
                       if not item['available'] or not item['version_probe']['ok']]
@@ -285,7 +290,7 @@ write_files:
                   "bootstrap_complete": complete, "authentication_checked": False,
                   "provisioned_versions_file": "/var/lib/jls-dev/versions.txt",
                   "commands": commands, "services": services, "docker": docker,
-                  "python_interpreters": python_interpreters,
+                  "python_interpreters": python_interpreters, "git_identity": git_identity,
                   "security_updates": security_updates, "storage": storage, "warnings": warnings,
                   "kvm": {"exists": Path('/dev/kvm').exists(),
                           "accessible": os.access('/dev/kvm', os.R_OK | os.W_OK)},
@@ -444,6 +449,7 @@ write_files:
         Codex:       jls-run codex login --device-auth
         Sandboxes:   sbx login
         GitHub:      gh auth login
+        Git:         git config --global user.name / user.email
         Paseo:       jls-run paseo
       No model or repository credentials were baked into this VM.
       EOF
