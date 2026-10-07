@@ -134,6 +134,19 @@ class AwarenessTests(unittest.TestCase):
         for name in ('go', 'rustc', 'cargo', 'cmake', 'ninja', 'sqlite3', 'git-lfs'):
             self.assertTrue(report['commands'][name]['version_probe']['ok'])
 
+    def test_doctor_checks_guest_agent_only_with_virtio_channel(self):
+        channel = '/dev/virtio-ports/org.qemu.guest_agent.0'
+        probe = lambda argv: {'ok': argv[-1] != 'qemu-guest-agent', 'exit_code': 0, 'output': 'version'}
+        for present in (False, True):
+            with patch.object(self.doctor.shutil, 'which', side_effect=lambda name: '/bin/' + name), \
+                 patch.object(self.doctor, 'probe', side_effect=probe), \
+                 patch.object(self.doctor.Path, 'is_file', return_value=True), \
+                 patch.object(self.doctor.Path, 'exists', autospec=True,
+                              side_effect=lambda path: present and str(path) == channel):
+                report = self.doctor.collect()
+            self.assertEqual('qemu-guest-agent' in report['services'], present)
+            self.assertEqual(report['failures'], ['service:qemu-guest-agent'] if present else [])
+
     def test_doctor_failed_probe_timeout_and_json_exit(self):
         with patch.object(self.doctor.subprocess, 'run', side_effect=subprocess.TimeoutExpired('probe', 5)):
             self.assertFalse(self.doctor.probe(['probe'])['ok'])

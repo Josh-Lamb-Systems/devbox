@@ -22,6 +22,10 @@ Proxmox generates cloud-init user-data from `ciuser`, `sshkeys`, hostname, and r
 
 The bootstrap discovers the normal `/home` login user at runtime, so it works whether `ciuser` is `josh`, `ubuntu`, or another name. If a guest intentionally has several normal users, run the bootstrap manually with `sudo JLS_DEV_USER=name /usr/local/sbin/jls-bootstrap-dev-vm` or hard-code the intended user in a derived copy.
 
+### Other platforms
+
+The vendor-data file is plain cloud-config and also works on other Ubuntu cloud-init platforms (for example AWS, GCP, Azure, Hetzner, Multipass, or LXD VMs). Those platforms usually accept only user-data, so supply it as user-data and rely on the image's default login user or add your own `users:` entry. The QEMU guest agent is installed everywhere but only started, and only checked by `jls-doctor`, when the hypervisor exposes its virtio channel.
+
 ## Build the template
 
 `qmtemplatemaker.sh` downloads the latest **supported, released Ubuntu Server LTS
