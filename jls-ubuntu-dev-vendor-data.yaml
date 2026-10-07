@@ -1,7 +1,8 @@
 #cloud-config
-# JLS persistent Ubuntu developer VM bootstrap for Proxmox.
-# Attach this as *vendor-data* so Proxmox can continue generating user-data
-# containing ciuser, SSH keys, hostname, and network settings.
+# JLS persistent Ubuntu developer VM bootstrap for any cloud-init platform.
+# On Proxmox, attach this as *vendor-data* so Proxmox can continue generating
+# user-data containing ciuser, SSH keys, hostname, and network settings.
+# Elsewhere it also works as user-data, provided a normal login user exists.
 
 timezone: America/New_York
 locale: en_US.UTF-8
@@ -251,8 +252,11 @@ write_files:
 
       def collect():
           commands = command_check()
-          services = {name: probe(["systemctl", "is-active", name])
-                      for name in ("docker", "qemu-guest-agent")}
+          # The guest agent only runs where the hypervisor exposes its channel.
+          service_names = ["docker"]
+          if Path('/dev/virtio-ports/org.qemu.guest_agent.0').exists():
+              service_names.append("qemu-guest-agent")
+          services = {name: probe(["systemctl", "is-active", name]) for name in service_names}
           docker = {"compose": probe(["docker", "compose", "version"]),
                     "buildx": probe(["docker", "buildx", "version"]),
                     "daemon_access": probe(["docker", "info", "--format", "{{.ServerVersion}}"])}
@@ -473,14 +477,15 @@ write_files:
 
       echo "[$(date --iso-8601=seconds)] Starting JLS developer VM bootstrap"
 
-      # Proxmox creates the login account through its generated user-data.
+      # The platform's user-data (Proxmox ciuser, a cloud image's default user)
+      # creates the login account.
       # Select the first normal /home user, with an optional explicit override.
       dev_user="${JLS_DEV_USER:-}"
       if [ -z "$dev_user" ]; then
         dev_user="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $6 ~ /^\/home\// && $7 !~ /(nologin|false)$/ { print $1; exit }')"
       fi
       if [ -z "$dev_user" ] || ! id "$dev_user" >/dev/null 2>&1; then
-        echo 'Could not identify the Proxmox cloud-init login user.' >&2
+        echo 'Could not identify the cloud-init login user; set JLS_DEV_USER.' >&2
         exit 1
       fi
       dev_home="$(getent passwd "$dev_user" | cut -d: -f6)"
@@ -524,7 +529,11 @@ write_files:
         docker-sbx
 
       systemctl enable --now docker
-      systemctl enable --now qemu-guest-agent
+      # The static guest-agent unit binds to the hypervisor's virtio channel
+      # (Proxmox's QEMU Guest Agent option); udev starts it if that appears later.
+      if [ -e /dev/virtio-ports/org.qemu.guest_agent.0 ]; then
+        systemctl start qemu-guest-agent
+      fi
       sysctl --system >/dev/null
 
       # Ubuntu packages fd as fdfind to avoid a historical name collision.
@@ -535,7 +544,7 @@ write_files:
       usermod --append --groups docker "$dev_user"
 
       # Local Docker Sandboxes use KVM; nested virtualization must be exposed
-      # by the Proxmox host. Allow cloud-only use when /dev/kvm is unavailable.
+      # by the hypervisor. Allow cloud-only use when /dev/kvm is unavailable.
       groupadd --force kvm
       usermod --append --groups kvm "$dev_user"
 
