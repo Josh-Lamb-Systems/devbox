@@ -230,15 +230,27 @@ write_files:
           return result
 
 
-      def collect():
+      def command_check():
           commands = {}
           for name in ("curl", "git", "gh", "jq", "rg", "fd", "mise", "node", "npm",
                        "uv", "python", "python3", "go", "rustc", "cargo", "cmake", "ninja", "sqlite3", "git-lfs",
                        "make", "gcc", "tmux", "docker", "sbx", "claude", "codex", "paseo"):
               path = shutil.which(name)
-              version_arg = {"tmux": "-V", "go": "version"}.get(name, "--version")
+              version_arg = {"tmux": "-V", "go": "version", "sbx": "version"}.get(name, "--version")
               version = probe([path, version_arg]) if path else None
               commands[name] = {"path": path, "available": bool(path), "version_probe": version}
+          return commands
+
+
+      def print_commands(commands):
+          for name, item in commands.items():
+              version = item['version_probe']
+              status = (version['output'].splitlines() or ['version unavailable'])[0] if version else 'MISSING'
+              print(f"{name:16} {item['path'] or '-'} | {status}")
+
+
+      def collect():
+          commands = command_check()
           services = {name: probe(["systemctl", "is-active", name])
                       for name in ("docker", "qemu-guest-agent")}
           docker = {"compose": probe(["docker", "compose", "version"]),
@@ -284,16 +296,20 @@ write_files:
       def main():
           parser = argparse.ArgumentParser(description=__doc__)
           parser.add_argument('--json', action='store_true', help='Print one JSON object; exit 1 when not ready')
+          parser.add_argument('--tools', action='store_true', help='List tool paths and versions only')
           args = parser.parse_args()
+          if args.tools:
+              print_commands(command_check())
+              print(f"{'mise python':16} {probe(['mise', 'which', 'python'])['output'] or 'UNAVAILABLE'}")
+              compose = probe(['docker', 'compose', 'version'])
+              print(f"{'docker compose':16} {compose['output'] if compose['ok'] else 'UNAVAILABLE'}")
+              return 0
           report = collect()
           if args.json:
               print(json.dumps(report, indent=2))
           else:
               print(f"Checking as {report['user']} (uid {report['uid']})")
-              for name, item in report['commands'].items():
-                  version = item['version_probe']
-                  status = (version['output'].splitlines() or ['version unavailable'])[0] if version else 'MISSING'
-                  print(f"{name:16} {item['path'] or '-'} | {status}")
+              print_commands(report['commands'])
               for name, item in report['services'].items():
                   print(f"service {name}: {'active' if item['ok'] else 'NOT ACTIVE'}")
               for name, item in report['docker'].items():
@@ -343,53 +359,16 @@ write_files:
     owner: root:root
     permissions: '0644'
     content: |
-      # JLS development environment
+      # JLS devbox (persistent Ubuntu VM)
 
-      This is a persistent Ubuntu developer VM. Project instructions, runtime pins,
-      and lockfiles determine project workflows; these are machine capabilities.
-
-      - Provisioned: mise, Node.js/npm, uv, Go, Rust/Cargo, mise Python and system Python, GCC/make,
-        CMake/Ninja, SQLite CLI/headers, Git/LFS/gh, curl, jq, rg, fd, tmux,
-        Docker Engine, Buildx, Compose v2, and Docker Sandboxes (sbx).
-      - mise manages the default Node.js, uv, Go, Rust, and development Python installations. Honor repository pins;
-        do not change global runtimes to satisfy a single project.
-      - For Rust use mise shims or `mise exec -- cargo ...`. For existing
-        rust-toolchain.toml projects, configure mise idiomatic-file discovery for
-        rust rather than introducing a conflicting version pin.
-      - Ubuntu owns /usr/bin/python3. mise selects development Python (global 3.14
-        series, with project overrides); uv manages project .venv and dependencies.
-        Honor mise.toml, pyproject.toml, and uv.lock. If a repository only has
-        .python-version, configure mise Python idiomatic-file discovery or add an
-        agreeing project pin. Do not silently use the global version instead.
-      - Explicitly pass the selected interpreter, for example:
-        `uv sync --python "$(mise which python)" --no-python-downloads`.
-        For a standalone environment use `uv venv --python "$(mise which python)" --no-python-downloads`.
-        Do not use uv python install or --managed-python in this setup.
-        If requirements disagree, resolve the project Python pin first.
-        Never use sudo pip or --break-system-packages, or replace system Python.
-        python3-dev supplies headers for Ubuntu's Python, not every mise Python version.
-      - Use `docker compose` (v2). `fd` is a symlink to Ubuntu's `fdfind`.
-      - Keep dependencies and service data scoped to each repository. Use separate
-        Python environments and Compose project names/volumes for different projects.
-      - System security updates are configured daily with automatic reboot disabled.
-        jls-doctor checks effective settings/timers, not last-update success.
-        Storage warnings are informational; critical disk/inode shortages fail readiness.
-        Diagnose usage before removing data; never automatically prune Docker volumes.
-      - Run `jls-doctor --json` as your current user when verifying readiness or
-        troubleshooting. Exit 1 still returns a valid report describing failures.
-      - `/var/lib/jls-dev/versions.txt` records provisioning-time versions, not current
-        versions. Check live versions when they matter.
-      - Before reinstalling a missing tool, check PATH and mise. User tools live in
-        `$HOME/.local/bin` and `$HOME/.local/share/mise/shims`.
-      - For headless launches use `jls-run codex`, `jls-run claude`, or `jls-run paseo`.
-        This sets PATH explicitly without relying on interactive shell startup files.
-      - Installed CLIs do not imply authenticated accounts. Logins remain interactive.
-      - Local Docker Sandboxes require accessible /dev/kvm and host nested virtualization.
-        Missing KVM does not prevent ordinary development or cloud sandbox use.
-      - These capabilities describe the devbox host. Inside a container or sandbox,
-        inspect that environment rather than assuming host tools or access exist.
-      - If provisioning is incomplete, inspect `cloud-init status --long` and
-        `/var/log/jls-dev-bootstrap.log` before attempting repairs.
+      - Tools: mise (Node, Go, Rust, uv, Python), gcc/make, cmake/ninja, sqlite3, git/lfs/gh, curl, jq, rg, fd (=fdfind), tmux, docker + `docker compose` plugin + buildx, sbx, claude, codex, paseo. For versions/paths run `jls-doctor --tools`; check there, ~/.local/bin, and mise shims before reinstalling anything.
+      - Repo pins/lockfiles win (mise.toml, pyproject.toml, uv.lock, rust-toolchain.toml). Never change global runtimes for one project. If a repo has only .python-version or rust-toolchain.toml, enable mise idiomatic-file discovery rather than adding a conflicting pin.
+      - Python: `uv sync --python "$(mise which python)" --no-python-downloads` (same flags for `uv venv`). Ubuntu owns /usr/bin/python3: no sudo pip, --break-system-packages, `uv python install`, or --managed-python.
+      - Rust: mise installs it via rustup, so binaries live in ~/.cargo/bin; use mise shims or `mise exec -- cargo`.
+      - Scope deps/data per repo (own .venv, Compose project name/volumes). Never auto-prune Docker volumes.
+      - Installed CLIs may be unauthenticated; logins are interactive.
+      - Troubleshoot with `jls-doctor --json` (exit 1 still returns a valid report), then `cloud-init status --long` and /var/log/jls-dev-bootstrap.log.
+      - Inside a container/sandbox, inspect it; these notes describe the host. Local `sbx` sandboxes need /dev/kvm.
 
   - path: /usr/local/lib/jls-dev/install-agent-context
     owner: root:root
@@ -504,7 +483,7 @@ write_files:
 
       export DEBIAN_FRONTEND=noninteractive
 
-      # Docker Engine + Buildx + Compose v2 + Sandboxes from Docker's apt repository.
+      # Docker Engine + Buildx + Compose plugin + Sandboxes from Docker's apt repository.
       install -d -m 0755 /etc/apt/keyrings
       curl --fail --silent --show-error --location \
         https://download.docker.com/linux/ubuntu/gpg \
@@ -628,7 +607,7 @@ write_files:
           echo "cargo=$(mise exec -- cargo --version)"
           echo "docker=$(docker --version 2>/dev/null || true)"
           echo "compose=$(docker compose version 2>/dev/null || true)"
-          echo "sbx=$(sbx --version)"
+          echo "sbx=$(sbx version)"
           echo "claude=$(claude --version 2>/dev/null || true)"
           echo "codex=$(codex --version 2>/dev/null || true)"
           echo "paseo=$(paseo --version 2>/dev/null || true)"
