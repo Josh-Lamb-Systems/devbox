@@ -74,6 +74,20 @@ class AwarenessTests(unittest.TestCase):
         self.assertTrue((codex / 'AGENTS.md').read_text().startswith(original))
         self.assertTrue((codex / 'AGENTS.override.md').read_text().startswith('Temporary rules\n'))
 
+    def test_pi_receives_guide_in_the_context_file_it_loads(self):
+        home = self.root / 'home'
+        pi = home / '.pi/agent'
+        source = self.root / 'agent-context.md'
+        with patch.dict(os.environ, {'PI_CODING_AGENT_DIR': str(pi)}):
+            self.installer.install(home, source)
+            self.assertIn(self.installer.START, (pi / 'AGENTS.md').read_text())
+            (pi / 'AGENTS.md').unlink()
+            (pi / 'CLAUDE.md').write_text('Personal rules\n')
+            self.installer.install(home, source)
+        self.assertFalse((pi / 'AGENTS.md').exists())
+        self.assertTrue((pi / 'CLAUDE.md').read_text().startswith('Personal rules\n'))
+        self.assertIn(self.installer.START, (pi / 'CLAUDE.md').read_text())
+
     def test_malformed_markers_fail_without_writes(self):
         home = self.root / 'home'
         codex = home / '.codex'

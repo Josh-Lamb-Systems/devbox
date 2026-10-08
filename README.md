@@ -8,6 +8,7 @@ The attached `jls-ubuntu-dev-vendor-data.yaml` provisions an Ubuntu cloud image 
 - Mise with the current Node.js LTS, `uv`, Go, stable Rust/Cargo, and Python 3.14 selected globally;
 - Claude Code on Anthropic's stable native channel;
 - Codex from OpenAI's standalone installer;
+- Pi from its official installer (a managed install that updates with `pi update`);
 - Paseo's headless server/CLI, plus GitHub CLI;
 - Git/LFS, curl, jq, ripgrep, fd, fzf, tmux, CMake/Ninja, SQLite CLI/development headers, system Python/venv/development headers, and common diagnostics;
 - QEMU guest agent, a small `jls-doctor` check, version recording, and bounded Docker logs.
@@ -143,6 +144,7 @@ Run these as the normal login user after cloud-init completes:
 ```bash
 jls-run claude
 jls-run codex login --device-auth
+jls-run pi
 gh auth login
 sbx login
 jls-run paseo
@@ -150,8 +152,9 @@ jls-run paseo
 
 - Claude Code handles an unreachable callback in SSH sessions by showing a login code that can be pasted back into the terminal.
 - Codex's device-auth flow is designed for headless systems and uses an eligible ChatGPT subscription when that sign-in method is chosen.
+- Pi supports subscription and API-key providers; run `/login` inside Pi to choose one. Credentials are stored in `~/.pi/agent/auth.json`.
 - Paseo's native server/CLI is explicitly intended for headless machines and dev boxes. The first `paseo` run starts its daemon and offers an end-to-end encrypted relay with a pairing QR code; direct LAN, Tailscale, or another VPN is also supported.
-- Paseo manages locally installed agents rather than bundling them, which is why the image installs Claude Code, Codex, and `gh` before Paseo is paired.
+- Paseo manages locally installed agents rather than bundling them, which is why the image installs Claude Code, Codex, Pi, and `gh` before Paseo is paired.
 
 Do not automate these logins in cloud-init or bake their resulting credential files into a template or snapshot.
 
@@ -176,9 +179,11 @@ existing VM. The bootstrap installs their required packages and enables timers.
 ## Agent awareness and headless launches
 
 The bootstrap adds a managed environment guide to the discovered user's
-`~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md`. An existing Codex
-`AGENTS.override.md` also receives the guide because it takes precedence over
-`AGENTS.md`. Existing personal text, file permissions, and symlinks are preserved;
+`~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`, and `~/.pi/agent/AGENTS.md`. An
+existing Codex `AGENTS.override.md` also receives the guide because it takes
+precedence over `AGENTS.md`. Pi loads only the first of `AGENTS.override.md`,
+`AGENTS.md`, or `CLAUDE.md` in its agent directory, so the guide goes into
+whichever of those already exists. Existing personal text, file permissions, and symlinks are preserved;
 reruns replace only the block between the JLS markers. Malformed or duplicate
 markers stop the update instead of guessing which text to replace.
 
@@ -186,10 +191,11 @@ The common source is `/usr/local/share/jls-dev/agent-context.md`. It describes
 installed tools, mise runtime management, project isolation, troubleshooting,
 and the distinction between installed and authenticated CLIs. It keeps machine
 details out of repository instructions. Start a new agent session after updates.
-For a separate Codex profile, run as the login user:
+For a separate Codex or Pi profile, run as the login user:
 
 ```bash
 CODEX_HOME=/path/to/profile /usr/local/lib/jls-dev/install-agent-context
+PI_CODING_AGENT_DIR=/path/to/agent-dir /usr/local/lib/jls-dev/install-agent-context
 ```
 
 Use the launcher for direct or headless execution, as the normal login user:
@@ -197,6 +203,7 @@ Use the launcher for direct or headless execution, as the normal login user:
 ```bash
 jls-run codex
 jls-run claude
+jls-run pi
 jls-run paseo
 jls-run jls-doctor --json
 ```
@@ -365,7 +372,7 @@ The script is designed to be rerunnable:
 sudo /usr/local/sbin/jls-bootstrap-dev-vm
 ```
 
-Mise, Claude Code, Codex, and Paseo resolve to current supported releases when provisioned. The resolved versions are recorded in `/var/lib/jls-dev/versions.txt`. For a stricter production runtime, replace floating channels with tested exact versions and rebuild the template on a schedule.
+Mise, Claude Code, Codex, Pi, and Paseo resolve to current supported releases when provisioned. The resolved versions are recorded in `/var/lib/jls-dev/versions.txt`. For a stricter production runtime, replace floating channels with tested exact versions and rebuild the template on a schedule.
 
 To troubleshoot cloud-init:
 
@@ -397,6 +404,7 @@ Other current implementations reinforce the same layers:
 - [Claude Code authentication](https://code.claude.com/docs/en/authentication)
 - [Codex CLI](https://developers.openai.com/codex/cli)
 - [Codex authentication](https://developers.openai.com/codex/auth)
+- [Pi](https://pi.dev) ([source](https://github.com/earendil-works/pi))
 - [Paseo getting started](https://paseo.sh/docs)
 - [Moving Development to the Cloud: The AI-First Home Server](https://hussainweb.me/blog/moving-dev-to-proxmox-ai-agents/)
 - [`katspaugh/machine`](https://github.com/katspaugh/machine)
