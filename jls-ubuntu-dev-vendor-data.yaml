@@ -235,7 +235,7 @@ write_files:
           commands = {}
           for name in ("curl", "git", "gh", "jq", "rg", "fd", "mise", "node", "npm",
                        "uv", "python", "python3", "go", "rustc", "cargo", "cmake", "ninja", "sqlite3", "git-lfs",
-                       "make", "gcc", "tmux", "docker", "sbx", "claude", "codex", "paseo"):
+                       "make", "gcc", "tmux", "docker", "sbx", "claude", "codex", "pi", "paseo"):
               path = shutil.which(name)
               version_arg = {"tmux": "-V", "go": "version", "sbx": "version"}.get(name, "--version")
               version = probe([path, version_arg]) if path else None
@@ -370,7 +370,7 @@ write_files:
     content: |
       # JLS devbox (persistent Ubuntu VM)
 
-      - Tools: mise (Node, Go, Rust, uv, Python), gcc/make, cmake/ninja, sqlite3, git/lfs/gh, curl, jq, rg, fd (=fdfind), tmux, docker + `docker compose` plugin + buildx, sbx, claude, codex, paseo. For versions/paths run `jls-doctor --tools`; check there, ~/.local/bin, and mise shims before reinstalling anything.
+      - Tools: mise (Node, Go, Rust, uv, Python), gcc/make, cmake/ninja, sqlite3, git/lfs/gh, curl, jq, rg, fd (=fdfind), tmux, docker + `docker compose` plugin + buildx, sbx, claude, codex, pi, paseo. For versions/paths run `jls-doctor --tools`; check there, ~/.local/bin, and mise shims before reinstalling anything.
       - Repo pins/lockfiles win (mise.toml, pyproject.toml, uv.lock, rust-toolchain.toml). Never change global runtimes for one project. If a repo has only .python-version or rust-toolchain.toml, enable mise idiomatic-file discovery rather than adding a conflicting pin.
       - Python: `uv sync --python "$(mise which python)" --no-python-downloads` (same flags for `uv venv`). Ubuntu owns /usr/bin/python3: no sudo pip, --break-system-packages, `uv python install`, or --managed-python.
       - Rust: mise installs it via rustup, so binaries live in ~/.cargo/bin; use mise shims or `mise exec -- cargo`.
@@ -414,6 +414,11 @@ write_files:
           override = codex_home / 'AGENTS.override.md'
           if override.exists():
               targets.append(override)
+          # Pi loads only the first context file it finds in its agent directory.
+          pi_dir = Path(os.environ.get('PI_CODING_AGENT_DIR') or home / '.pi/agent')
+          pi_names = ['AGENTS.override.md', 'AGENTS.md', 'AGENTS.MD', 'CLAUDE.md', 'CLAUDE.MD']
+          targets.append(next((pi_dir / name for name in pi_names if (pi_dir / name).exists()),
+                              pi_dir / 'AGENTS.md'))
           updates = []
           for target in targets:
               # Follow user-managed symlinks while preserving the symlink itself.
@@ -451,6 +456,7 @@ write_files:
         Check:       jls-doctor
         Claude:      jls-run claude
         Codex:       jls-run codex login --device-auth
+        Pi:          jls-run pi, then /login
         Sandboxes:   sbx login
         GitHub:      gh auth login
         Git:         git config --global user.name / user.email
@@ -572,6 +578,9 @@ write_files:
 
         # Official Codex standalone installer.
         curl -fsSL https://chatgpt.com/codex/install.sh | sh
+
+        # Official Pi installer (managed, pinned dependencies; updates with pi update).
+        curl -fsSL https://pi.dev/install.sh | sh
       '
 
       # Ensure interactive shells activate mise without duplicating the block.
@@ -600,7 +609,7 @@ write_files:
 
       # Install machine guidance as the discovered user, preserving personal text.
       runuser --user "$dev_user" -- env HOME="$dev_home" CODEX_HOME="$dev_home/.codex" \
-        /usr/local/lib/jls-dev/install-agent-context
+        PI_CODING_AGENT_DIR="$dev_home/.pi/agent" /usr/local/lib/jls-dev/install-agent-context
 
       # Record what this particular VM resolved at provision time.
       runuser --user "$dev_user" -- env HOME="$dev_home" bash -lc '
@@ -625,6 +634,7 @@ write_files:
           echo "sbx=$(sbx version)"
           echo "claude=$(claude --version 2>/dev/null || true)"
           echo "codex=$(codex --version 2>/dev/null || true)"
+          echo "pi=$(pi --version 2>/dev/null || true)"
           echo "paseo=$(paseo --version 2>/dev/null || true)"
         }
       ' >/var/lib/jls-dev/versions.txt
@@ -643,4 +653,4 @@ runcmd:
 
 final_message: |
   JLS developer VM cloud-init finished after $UPTIME seconds.
-  Log in again, run jls-doctor, then authenticate with claude, codex, gh, and paseo.
+  Log in again, run jls-doctor, then authenticate with claude, codex, pi, gh, and paseo.
