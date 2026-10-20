@@ -5,7 +5,7 @@
 The attached `jls-ubuntu-dev-vendor-data.yaml` provisions an Ubuntu cloud image as a persistent development runtime with:
 
 - Docker Engine from Docker's official apt repository, Buildx, `docker compose` v2, and Docker Sandboxes (`sbx`);
-- Mise with the current Node.js LTS, `uv`, Go, stable Rust/Cargo, and Python 3.14 selected globally;
+- Mise with the current Node.js LTS, `uv`, Go, stable Rust/Cargo, and Python 3.14 selected globally, plus the [`just`](https://github.com/casey/just) command runner;
 - Claude Code on Anthropic's stable native channel;
 - Codex from OpenAI's standalone installer;
 - Pi from its official installer (a managed install that updates with `pi update`);
@@ -285,7 +285,7 @@ Diagnostics do not delete data, prune containers/volumes, or run upgrades.
 The bootstrap selects global defaults through mise:
 
 ```bash
-mise use --global node@lts uv@latest go@latest rust@latest python@3.14
+mise use --global node@lts uv@latest go@latest rust@latest python@3.14 just@latest
 ```
 
 These are user-owned development runtimes. Project `mise.toml` files can override
@@ -297,6 +297,7 @@ those defaults; commit project pins and lockfiles for reproducibility.
 | Python | `python@3.14` | Latest available patch in the 3.14 series; upstream security support scheduled through October 2030 |
 | Go | `go@latest` | Latest stable at provisioning; upstream supports its two newest major release lines |
 | Rust | `rust@latest` | Latest stable at provisioning; upstream uses a six-week stable release cycle |
+| just | `just@latest` | Latest release at provisioning, from casey/just's GitHub release binaries |
 
 Python, Go, and Rust do **not** have upstream LTS channels equivalent to Node or
 Ubuntu. These defaults favor supported stable releases without inventing `lts`

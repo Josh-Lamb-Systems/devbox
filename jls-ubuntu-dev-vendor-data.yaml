@@ -235,7 +235,7 @@ write_files:
           commands = {}
           for name in ("curl", "git", "gh", "jq", "rg", "fd", "mise", "node", "npm",
                        "uv", "python", "python3", "go", "rustc", "cargo", "cmake", "ninja", "sqlite3", "git-lfs",
-                       "make", "gcc", "tmux", "docker", "sbx", "claude", "codex", "pi", "paseo"):
+                       "make", "gcc", "just", "tmux", "docker", "sbx", "claude", "codex", "pi", "paseo"):
               path = shutil.which(name)
               version_arg = {"tmux": "-V", "go": "version", "sbx": "version"}.get(name, "--version")
               version = probe([path, version_arg]) if path else None
@@ -370,7 +370,7 @@ write_files:
     content: |
       # JLS devbox (persistent Ubuntu VM)
 
-      - Tools: mise (Node, Go, Rust, uv, Python), gcc/make, cmake/ninja, sqlite3, git/lfs/gh, curl, jq, rg, fd (=fdfind), tmux, docker + `docker compose` plugin + buildx, sbx, claude, codex, pi, paseo. For versions/paths run `jls-doctor --tools`; check there, ~/.local/bin, and mise shims before reinstalling anything.
+      - Tools: mise (Node, Go, Rust, uv, Python, just), gcc/make, cmake/ninja, sqlite3, git/lfs/gh, curl, jq, rg, fd (=fdfind), tmux, docker + `docker compose` plugin + buildx, sbx, claude, codex, pi, paseo. For versions/paths run `jls-doctor --tools`; check there, ~/.local/bin, and mise shims before reinstalling anything.
       - Repo pins/lockfiles win (mise.toml, pyproject.toml, uv.lock, rust-toolchain.toml). Never change global runtimes for one project. If a repo has only .python-version or rust-toolchain.toml, enable mise idiomatic-file discovery rather than adding a conflicting pin.
       - Python: `uv sync --python "$(mise which python)" --no-python-downloads` (same flags for `uv venv`). Ubuntu owns /usr/bin/python3: no sudo pip, --break-system-packages, `uv python install`, or --managed-python.
       - Rust: mise installs it via rustup, so binaries live in ~/.cargo/bin; use mise shims or `mise exec -- cargo`.
@@ -562,7 +562,7 @@ write_files:
 
         # Python has a supported minor series, not an LTS alias. Go and Rust
         # have no upstream LTS channel: latest selects stable at provisioning.
-        mise use --global node@lts uv@latest go@latest rust@latest python@3.14
+        mise use --global node@lts uv@latest go@latest rust@latest python@3.14 just@latest
         # Check the development interpreter without changing /usr/bin/python3.
         mise exec -- python --version
         mise exec -- python -c "import ssl, sqlite3, venv; print(ssl.OPENSSL_VERSION)"
@@ -570,6 +570,7 @@ write_files:
         mise exec -- go version
         mise exec -- rustc --version
         mise exec -- cargo --version
+        mise exec -- just --version
         mise exec -- npm install --global @getpaseo/cli
         mise reshim
 
@@ -629,6 +630,7 @@ write_files:
           echo "go=$(mise exec -- go version)"
           echo "rustc=$(mise exec -- rustc --version)"
           echo "cargo=$(mise exec -- cargo --version)"
+          echo "just=$(mise exec -- just --version)"
           echo "docker=$(docker --version 2>/dev/null || true)"
           echo "compose=$(docker compose version 2>/dev/null || true)"
           echo "sbx=$(sbx version)"
